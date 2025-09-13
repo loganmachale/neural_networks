@@ -5,19 +5,18 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-from environment import ScheduledCartPoleEnv
+from balancing_env import BalancingCartPoleEnv # Import the new environment
 from model import HLTCN
 
 # --- Hyperparameters ---
-EPISODES = 2500  # Increased episodes for the more complex task
-GAMMA = 0.99
+EPISODES = 1000 # This task is simpler, so fewer episodes may be needed
+GAMMA = 0.98
 LEARNING_RATE = 0.0005
-# MAX_STEPS_PER_EPISODE is now defined inside the environment
-SEGMENT_LENGTH = 32  # Update model every 32 steps (Deep Supervision)
+SEGMENT_LENGTH = 12
 
 def main():
-    env = ScheduledCartPoleEnv()
-    obs_size = env.observation_space.shape[0]
+    env = BalancingCartPoleEnv() # Use the new balancing-focused environment
+    obs_size = env.observation_space.shape[0] # Will be 4
     action_size = env.action_space.n
     
     model = HLTCN(obs_size, action_size)
@@ -26,7 +25,7 @@ def main():
     scores = []
     scores_window = deque(maxlen=100)
     
-    progress_bar = tqdm(range(1, EPISODES + 1), desc="Training", unit="episode")
+    progress_bar = tqdm(range(1, EPISODES + 1), desc="Training Balancer", unit="episode")
 
     for episode in progress_bar:
         obs, _ = env.reset()
@@ -35,7 +34,6 @@ def main():
         episode_rewards = []
         done = False
         
-        # The main loop continues as long as the episode is not done
         while not done:
             log_probs, values, rewards = [], [], []
 
@@ -43,7 +41,6 @@ def main():
             for _ in range(SEGMENT_LENGTH):
                 obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
                 
-                # Detach hidden states for stability (prevents BPTT across segments)
                 if h_low is not None: h_low = h_low.detach()
                 if h_high is not None: h_high = h_high.detach()
 
@@ -65,7 +62,6 @@ def main():
             R = 0
             if not done:
                 with torch.no_grad():
-                    # Bootstrap from the value of the next state
                     _, _, last_value, _, _ = model(torch.from_numpy(obs).float().unsqueeze(0), h_low, h_high)
                     R = last_value.item()
 
@@ -87,7 +83,7 @@ def main():
             
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5) 
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
         
         current_score = sum(episode_rewards)
@@ -100,21 +96,22 @@ def main():
                 "Loss": f"{loss.item():.4f}"
             })
             
-    # Save the model and plot scores
-    torch.save(model.state_dict(), 'hltcn_model.pth')
+    # --- Save the trained balancing model to a new file ---
+    torch.save(model.state_dict(), 'balancing_model.pth')
+    print("\nBalancing model saved to balancing_model.pth")
     
+    # Plotting
     plt.figure(figsize=(10, 5))
     plt.plot(scores)
-    plt.title("Scores per Episode")
+    plt.title("Balancing Training Scores per Episode")
     plt.ylabel("Total Reward")
     plt.xlabel("Episode")
     moving_avg = [np.mean(scores[max(0, i-100):i+1]) for i in range(len(scores))]
     plt.plot(moving_avg, color='red', linewidth=2, label='100-episode MA')
     plt.grid(True)
     plt.legend()
-    plt.savefig("training_scores.png")
+    plt.savefig("balancing_training_scores.png")
     plt.show()
 
 if __name__ == "__main__":
     main()
-
