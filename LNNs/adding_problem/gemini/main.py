@@ -5,97 +5,127 @@ import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import random
+import json
+import os
+from html import escape
+
+# Integrated torchdiffeq for advanced ODE solving.
+try:
+    from torchdiffeq import odeint_adjoint as odeint
+except ImportError:
+    print("Error: torchdiffeq library not found. Please install it (`pip install torchdiffeq`).")
+    exit()
 
 class CustomLNN(nn.Module):
-    def __init__(self, input_dim, hidden_sizes, output_dim, tau_mean=1.0, tau_sigma=0.1):
+    def __init__(self, input_dim, hidden_sizes, output_dim, p_excitatory=0.8):
         super(CustomLNN, self).__init__()
         self.input_dim = input_dim
         self.hidden_sizes = hidden_sizes
         self.output_dim = output_dim
-        self.num_layers = len(hidden_sizes)
+        self.num_hidden_layers = len(hidden_sizes)
 
-        all_sizes = [input_dim] + hidden_sizes
+        self.log_tau = nn.ParameterList([nn.Parameter(torch.full((size,), np.log(5.0))) for size in hidden_sizes])
+        self.log_Cm = nn.ParameterList([nn.Parameter(torch.full((size,), np.log(1.0))) for size in hidden_sizes])
+        self.x_leak = nn.ParameterList([nn.Parameter(torch.full((size,), 0.0)) for size in hidden_sizes])
 
-        self.layers = nn.ModuleList()
-        for i in range(self.num_layers):
-            self.layers.append(nn.Linear(all_sizes[i], all_sizes[i+1]))
+        all_dims = [self.input_dim] + hidden_sizes
+        self.W_abs = nn.ParameterList()
+        self.W_polarity = []
+        self.E_rev = []
+
+        for i in range(self.num_hidden_layers):
+            dim_in = all_dims[i]
+            dim_out = all_dims[i+1]
+            polarity = torch.where(torch.rand(dim_out, dim_in) < p_excitatory, 1.0, -1.0)
+            self.W_polarity.append(polarity)
+            self.E_rev.append(torch.where(polarity > 0, 1.0, -1.0))
+            self.W_abs.append(nn.Parameter(torch.abs(torch.randn(dim_out, dim_in) * 0.1)))
+
+        for size in hidden_sizes:
+            polarity = torch.where(torch.rand(size, size) < p_excitatory, 1.0, -1.0)
+            self.W_polarity.append(polarity)
+            self.E_rev.append(torch.where(polarity > 0, 1.0, -1.0))
+            self.W_abs.append(nn.Parameter(torch.abs(torch.randn(size, size) * 0.1)))
 
         self.output_layer = nn.Linear(hidden_sizes[-1], output_dim)
 
-        self.taus = nn.ParameterList([
-            nn.Parameter(torch.normal(tau_mean, tau_sigma, (size,))) for size in hidden_sizes
-        ])
-
-    def ode_func(self, A_list, u):
+    def _ode_func_list(self, t, A_list, u):
         dAs = []
         prev_layer_output = u
-
-        for l in range(self.num_layers):
+        for l in range(self.num_hidden_layers):
             A = A_list[l]
-            re_tau = 1.0 / (F.relu(self.taus[l]) + 1e-7)
-            layer_input = self.layers[l](prev_layer_output)
-            dA = re_tau * (-A + layer_input)
+            W_in = torch.abs(self.W_abs[l]) * self.W_polarity[l].to(A.device)
+            E_in = self.E_rev[l].to(A.device)
+            rec_idx = self.num_hidden_layers + l
+            W_rec = torch.abs(self.W_abs[rec_idx]) * self.W_polarity[rec_idx].to(A.device)
+            E_rec = self.E_rev[rec_idx].to(A.device)
+            inv_tau = 1.0 / torch.exp(self.log_tau[l])
+            inv_Cm = 1.0 / torch.exp(self.log_Cm[l])
+            tanh_A = torch.tanh(A)
+            coupling_in = F.linear(prev_layer_output, W_in)
+            coupling_E_in = F.linear(prev_layer_output, W_in * E_in)
+            coupling_rec = F.linear(tanh_A, W_rec)
+            coupling_E_rec = F.linear(tanh_A, W_rec * E_rec)
+            total_coupling = coupling_in + coupling_rec
+            total_coupling_E = coupling_E_in + coupling_E_rec
+            term1 = -(inv_tau + total_coupling * inv_Cm) * A
+            term2 = (self.x_leak[l] * inv_tau) + (total_coupling_E * inv_Cm)
+            dA = term1 + term2
             dAs.append(dA)
-            prev_layer_output = torch.tanh(A)
-
+            prev_layer_output = tanh_A
         return dAs
 
-    def forward(self, x, dt=0.05):
+    def _ode_func_flat(self, t, h, u):
+        A_list = list(torch.split(h, self.hidden_sizes, dim=-1))
+        dA_list = self._ode_func_list(t, A_list, u)
+        return torch.cat(dA_list, dim=-1)
+
+    def forward(self, x, integration_time_per_step):
         batch_size, T, _ = x.shape
         A_list = [torch.zeros(batch_size, size, device=x.device) for size in self.hidden_sizes]
-        
+        A_flat = torch.cat(A_list, dim=-1)
+        t_span_step = torch.tensor([0.0, integration_time_per_step], device=x.device)
+        adjoint_params = tuple(self.parameters())
+
         for t in range(T):
             u = x[:, t, :]
-            
-            k1_list = self.ode_func(A_list, u)
-            A_k2 = [A + dt * 0.5 * k1 for A, k1 in zip(A_list, k1_list)]
-            k2_list = self.ode_func(A_k2, u)
-            A_k3 = [A + dt * 0.5 * k2 for A, k2 in zip(A_list, k2_list)]
-            k3_list = self.ode_func(A_k3, u)
-            A_k4 = [A + dt * k3 for A, k3 in zip(A_list, k3_list)]
-            k4_list = self.ode_func(A_k4, u)
+            ode_func_with_input = lambda time, h: self._ode_func_flat(time, h, u)
+            solution = odeint(
+                ode_func_with_input, A_flat, t_span_step, method='dopri5', rtol=1e-4, atol=1e-5,
+                adjoint_params=adjoint_params
+            )
+            A_flat = solution[-1]
 
-            A_list = [
-                A + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-                for A, k1, k2, k3, k4 in zip(A_list, k1_list, k2_list, k3_list, k4_list)
-            ]
-            
-        final_A = A_list[-1]
-        output = self.output_layer(torch.tanh(final_A))
+        final_A_list = torch.split(A_flat, self.hidden_sizes, dim=-1)
+        final_A_last_layer = final_A_list[-1]
+        output = self.output_layer(torch.tanh(final_A_last_layer))
         return output
 
 def generate_adding_data(batch_size, T, device):
-    values = torch.rand(batch_size, T, device=device)
-    
-    # CHANGE: The mask is now encoded as [-1, +1] instead of [0, 1].
-    # -1 provides an active inhibitory signal for the "ignore" timesteps.
-    masks = torch.full((batch_size, T), -1.0, device=device)
-    
-    t1 = torch.randint(0, T // 2, (batch_size,), device=device)
-    t2 = torch.randint(T // 2, T, (batch_size,), device=device)
-    
-    # Place the +1 "attend" signals at the correct locations.
-    masks.scatter_(1, t1.unsqueeze(1), 1.0)
-    masks.scatter_(1, t2.unsqueeze(1), 1.0)
-    
+    values = torch.rand(batch_size, T)
+    masks = torch.zeros(batch_size, T)
+    t1 = torch.randint(0, T // 2, (batch_size,))
+    t2 = torch.randint(T // 2, T, (batch_size,))
+    masks[torch.arange(batch_size), t1] = 1.0
+    masks[torch.arange(batch_size), t2] = 1.0
     x = torch.stack([values, masks], dim=2)
-    
-    # The target y is still the sum of values where the original mask was 1.
-    # We can calculate this by finding where the new mask is > 0.
-    y = (values * (masks > 0)).sum(dim=1, keepdim=True)
-    return x, y
+    y = (values * masks).sum(dim=1, keepdim=True)
+    return x.to(device), y.to(device)
 
 # Hyperparameters
+T = 50
 input_dim = 2
-hidden_sizes = [32, 32]
+hidden_sizes = [12, 8, 4] 
 output_dim = 1
-T = 100
 batch_size = 128
 epochs = 20
 lr = 0.005
-dt = 0.05
-lr_decay_step = 5
-lr_decay_gamma = 0.5
+INTEGRATION_TIME_PER_STEP = 1.0 
+
+# Define bounds for log_tau and log_Cm to ensure stability
+LOG_TAU_CM_MIN = np.log(0.1)
+LOG_TAU_CM_MAX = np.log(10.0)
 
 # Device
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -105,53 +135,53 @@ print(f"Using device: {device}")
 model = CustomLNN(input_dim, hidden_sizes, output_dim)
 model.to(device)
 optimizer = optim.Adam(model.parameters(), lr=lr)
-scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_decay_step, gamma=lr_decay_gamma)
+scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.5)
 criterion = nn.MSELoss()
-
-print_interval = max(1, epochs // 20)
 
 # Training
 losses = []
 for epoch in tqdm(range(epochs), desc="Training"):
     x, y = generate_adding_data(batch_size, T, device)
-    output = model(x, dt=dt)
+    output = model(x, INTEGRATION_TIME_PER_STEP)
     loss = criterion(output, y)
     
     optimizer.zero_grad()
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
+
+    # CHANGE: Clamp the time constant parameters after each step to prevent explosion.
+    with torch.no_grad():
+        for log_tau_l in model.log_tau:
+            log_tau_l.clamp_(LOG_TAU_CM_MIN, LOG_TAU_CM_MAX)
+        for log_Cm_l in model.log_Cm:
+            log_Cm_l.clamp_(LOG_TAU_CM_MIN, LOG_TAU_CM_MAX)
+            
     scheduler.step()
     
     losses.append(loss.item())
-    if (epoch + 1) % print_interval == 0:
+    if (epoch + 1) % 1 == 0:
         print(f"Epoch {epoch+1}, Loss: {loss.item():.5f}, LR: {scheduler.get_last_lr()[0]:.5f}")
 
-# Results/Analysis Visualization
+# Visualization
 plt.figure(figsize=(12, 5))
-
-# Loss curve
 plt.subplot(1, 2, 1)
 plt.plot(losses)
 plt.title("Training Loss Curve")
 plt.xlabel("Epoch")
 plt.ylabel("MSE Loss")
-plt.grid(True)
-plt.yscale('log')
+plt.grid(True); plt.yscale('log')
 
-# Test predictions vs true
 plt.subplot(1, 2, 2)
 with torch.no_grad():
     model.eval()
     test_x, test_y = generate_adding_data(200, T, device)
-    preds = model(test_x, dt=dt)
+    preds = model(test_x, INTEGRATION_TIME_PER_STEP)
     
 plt.scatter(test_y.cpu().numpy(), preds.cpu().numpy(), alpha=0.6, edgecolors='w', s=50)
 plt.plot([0, 2], [0, 2], 'r--', linewidth=2, label='Ideal y=x line')
 plt.title("Predictions vs. True Values")
 plt.xlabel("True Sum")
 plt.ylabel("Predicted Sum")
-plt.grid(True)
-plt.legend()
-plt.tight_layout()
+plt.grid(True); plt.legend(); plt.tight_layout()
 plt.show()
