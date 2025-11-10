@@ -1,168 +1,18 @@
 """
 Advanced Features for Logic Model (Future Enhancements)
 
-This module contains advanced reasoning techniques inspired by README3.md:
-- Monte Carlo Tree Search (MCTS) as an alternative to Alpha-Beta
+This module contains experimental learning features inspired by README3.md:
 - Neural Network-based scoring (Value Head + Policy Head)
 - Self-play training loop
+- Replay buffer for experience storage
 
-These are experimental features that extend the base Logic Model.
+Note: MCTS is now implemented in logic_model.py as the default search algorithm.
 """
 
 from typing import Dict, List, Tuple, Optional, Any
 from abc import ABC, abstractmethod
 import random
-import math
 from logic_model import InternalState, Goal, ActionDI, ScoringModule
-
-
-# =============================================================================
-# Monte Carlo Tree Search (MCTS) - Idea from README3.md
-# =============================================================================
-
-class MCTSNode:
-    """
-    Node in the Monte Carlo Tree Search.
-
-    Stores state information and search statistics.
-    """
-
-    def __init__(self, state: InternalState, parent: Optional['MCTSNode'] = None,
-                 action: Optional[ActionDI] = None, prior_prob: float = 1.0):
-        self.state = state
-        self.parent = parent
-        self.action = action  # Action that led to this node
-        self.children: Dict[str, 'MCTSNode'] = {}
-
-        # MCTS statistics
-        self.visit_count = 0
-        self.total_value = 0.0
-        self.prior_prob = prior_prob  # Prior probability from policy network
-
-    def is_leaf(self) -> bool:
-        """Check if this node is a leaf (not expanded)."""
-        return len(self.children) == 0
-
-    def get_value(self) -> float:
-        """Get the average value of this node."""
-        if self.visit_count == 0:
-            return 0.0
-        return self.total_value / self.visit_count
-
-    def get_ucb_score(self, c_puct: float = 1.0) -> float:
-        """
-        Get UCB (Upper Confidence Bound) score for node selection.
-
-        UCB balances exploitation (high value) with exploration (low visits).
-        """
-        if self.visit_count == 0:
-            return float('inf')
-
-        # UCB1 formula
-        exploitation = self.get_value()
-        exploration = c_puct * self.prior_prob * math.sqrt(self.parent.visit_count) / (1 + self.visit_count)
-
-        return exploitation + exploration
-
-
-class MCTSSearch:
-    """
-    Monte Carlo Tree Search implementation for reasoning.
-
-    Idea from README3.md: Alternative to Alpha-Beta that uses simulation
-    and statistical sampling instead of exhaustive search.
-    """
-
-    def __init__(self, scoring_module: ScoringModule, num_simulations: int = 100,
-                 c_puct: float = 1.0):
-        """
-        Args:
-            scoring_module: Scoring function for evaluating states
-            num_simulations: Number of MCTS simulations to run
-            c_puct: Exploration constant for UCB formula
-        """
-        self.scoring_module = scoring_module
-        self.num_simulations = num_simulations
-        self.c_puct = c_puct
-
-    def search(self, root_state: InternalState, goal: Goal,
-               available_actions: List[ActionDI]) -> ActionDI:
-        """
-        Run MCTS to find the best action.
-
-        Args:
-            root_state: Starting state
-            goal: Goal to achieve
-            available_actions: List of possible actions from root
-
-        Returns:
-            Best action to take
-        """
-        root = MCTSNode(root_state)
-
-        # Run simulations
-        for _ in range(self.num_simulations):
-            node = root
-
-            # Selection: traverse tree using UCB
-            while not node.is_leaf():
-                node = self._select_child(node)
-
-            # Expansion: add children if not terminal
-            if not root_state.achieves_goal(goal):
-                self._expand(node, available_actions, goal)
-
-            # Simulation: evaluate the state
-            value = self.scoring_module.score(node.state, goal)
-
-            # Backpropagation: update statistics
-            self._backpropagate(node, value)
-
-        # Select best action based on visit counts
-        return self._best_action(root)
-
-    def _select_child(self, node: MCTSNode) -> MCTSNode:
-        """Select child with highest UCB score."""
-        best_score = -float('inf')
-        best_child = None
-
-        for child in node.children.values():
-            score = child.get_ucb_score(self.c_puct)
-            if score > best_score:
-                best_score = score
-                best_child = child
-
-        return best_child
-
-    def _expand(self, node: MCTSNode, available_actions: List[ActionDI], goal: Goal):
-        """Expand node by creating children for all actions."""
-        for action in available_actions:
-            new_state = action.apply(node.state)
-            action_key = str(action)
-
-            # Create child node with uniform prior (can be replaced with policy network)
-            prior_prob = 1.0 / len(available_actions)
-            child = MCTSNode(new_state, parent=node, action=action, prior_prob=prior_prob)
-            node.children[action_key] = child
-
-    def _backpropagate(self, node: MCTSNode, value: float):
-        """Backpropagate value up the tree."""
-        while node is not None:
-            node.visit_count += 1
-            node.total_value += value
-            node = node.parent
-
-    def _best_action(self, root: MCTSNode) -> Optional[ActionDI]:
-        """Select action with highest visit count."""
-        best_visits = -1
-        best_action = None
-
-        for child in root.children.values():
-            if child.visit_count > best_visits:
-                best_visits = child.visit_count
-                best_action = child.action
-
-        return best_action
 
 
 # =============================================================================
@@ -347,32 +197,48 @@ def self_play_training_loop(neural_scorer: NeuralScorer,
 
 __doc__ += """
 
-## Usage Example (MCTS)
+## Usage Example (Neural Network Integration)
 
 ```python
-from logic_model import InternalState, Goal, ScoringModule
-from advanced_features import MCTSSearch
+from logic_model import InternalState, Goal, LogicModel
+from advanced_features import NeuralScorer, ReplayBuffer
 
-# Create state and goal
-state = InternalState()
-goal = Goal({...})
+# Create custom neural scorer (replace RandomNeuralScorer with real implementation)
+class MyNeuralScorer(NeuralScorer):
+    def predict_value(self, state):
+        # Implement with PyTorch/TensorFlow
+        pass
 
-# Create MCTS search
-scorer = ScoringModule()
-mcts = MCTSSearch(scorer, num_simulations=100)
+    def predict_policy(self, state, actions):
+        # Implement with PyTorch/TensorFlow
+        pass
 
-# Find best action
-best_action = mcts.search(state, goal, available_actions)
+    def train(self, experiences):
+        # Implement training loop
+        pass
+
+# Use with Logic Model
+scorer = MyNeuralScorer()
+replay_buffer = ReplayBuffer()
+
+# Train through self-play
+self_play_training_loop(scorer, initial_state, goal, num_episodes=100)
 ```
 
-## Future: Neural Network Integration
+## Future Implementation Path
 
-To integrate neural networks (as described in README3.md):
+To create a fully learned reasoning model (AlphaZero-style):
 
-1. Implement a real NeuralScorer using PyTorch/TensorFlow
-2. Replace MCTSSearch to use neural scorer for priors
-3. Implement full self-play training loop
-4. Train on domain-specific problems
+1. Implement real NeuralScorer using PyTorch/TensorFlow
+2. Create dual-head architecture (Value + Policy networks)
+3. Use MCTS from logic_model.py with neural network priors
+4. Implement full self-play training loop
+5. Train on domain-specific problems
 
-This would enable the model to learn its own heuristics!
+This would enable the model to learn optimal heuristics automatically!
+
+## Note on MCTS
+
+MCTS is now implemented in `logic_model.py` as the default search algorithm.
+Use `LogicModel(state, goal, search_type='mcts')` to access it.
 """

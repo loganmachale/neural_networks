@@ -5,7 +5,8 @@
       "Bash(dir:*)",
       "Bash(powershell -Command:*)",
       "Bash(python demo.py:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(echo:*)"
     ],
     "deny": [],
     "ask": []
